@@ -1,0 +1,4 @@
+workspace = "boringcache/fluentui"
+
+[adapters.nx]
+tag = "fluentui-nx-proof-v2"

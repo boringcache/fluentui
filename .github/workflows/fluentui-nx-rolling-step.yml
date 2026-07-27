@@ -1,0 +1,137 @@
+name: Fluent UI Nx rolling step
+
+on:
+  workflow_call:
+    inputs:
+      step:
+        description: Position in the rolling commit sequence.
+        required: true
+        type: string
+      base_sha:
+        description: Immediate parent used by Nx affected.
+        required: true
+        type: string
+      head_sha:
+        description: Fluent UI commit under test.
+        required: true
+        type: string
+      macos_runner:
+        description: macOS runner for the three upstream macOS lanes.
+        required: true
+        type: string
+      nx_parallel:
+        description: Nx parallelism matching the selected macOS runner.
+        required: true
+        type: string
+      strategies:
+        description: JSON array of benchmark strategies to run.
+        required: false
+        default: '["boringcache","control"]'
+        type: string
+    secrets:
+      BORINGCACHE_RESTORE_TOKEN:
+        required: true
+      BORINGCACHE_SAVE_TOKEN:
+        required: true
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  rolling:
+    name: Rolling ${{ inputs.step }} / ${{ matrix.strategy }} / ${{ matrix.workload }}
+    strategy:
+      fail-fast: false
+      matrix:
+        strategy: ${{ fromJSON(inputs.strategies) }}
+        workload:
+          - main
+          - react-compiler-analyzer
+          - react-major-versions-integration
+          - e2e
+    runs-on: ${{ matrix.workload == 'e2e' && 'ubuntu-latest' || inputs.macos_runner }}
+    timeout-minutes: 120
+    env:
+      NX_PARALLEL: ${{ inputs.nx_parallel }}
+      NX_PREFER_TS_NODE: true
+      NX_VERBOSE_LOGGING: true
+      BROWSERSLIST_IGNORE_OLD_DATA: true
+      NX_BASE: ${{ inputs.base_sha }}
+      NX_HEAD: ${{ inputs.head_sha }}
+      SOURCE_SHA: ${{ inputs.head_sha }}
+
+    steps:
+      - name: Start timing
+        shell: bash
+        run: echo "BENCHMARK_STARTED_AT=$(date +%s)" >> "$GITHUB_ENV"
+
+      - name: Checkout benchmark harness
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+          sparse-checkout: |
+            .boringcache.toml
+            .github/actions/fluentui-nx-proof
+            .yarn
+
+      - name: Checkout pinned Fluent UI commit
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          path: source
+          persist-credentials: false
+          ref: ${{ env.SOURCE_SHA }}
+
+      - name: Verify consecutive commit pair
+        shell: bash
+        working-directory: source
+        run: |
+          set -euo pipefail
+          [[ "$(git rev-parse "$NX_HEAD^")" == "$NX_BASE" ]]
+          [[ "$(git rev-parse HEAD)" == "$NX_HEAD" ]]
+          echo "base=$NX_BASE"
+          echo "head=$NX_HEAD"
+
+      - name: Run upstream lane with BoringCache
+        if: matrix.strategy == 'boringcache'
+        uses: ./.github/actions/fluentui-nx-proof
+        with:
+          workload: ${{ matrix.workload }}
+          cache: 'true'
+          phase: rolling-${{ inputs.step }}-boringcache
+          restore-token: ${{ secrets.BORINGCACHE_RESTORE_TOKEN }}
+          save-token: ${{ secrets.BORINGCACHE_SAVE_TOKEN }}
+
+      - name: Run upstream lane without Nx remote cache
+        if: matrix.strategy == 'control'
+        uses: ./.github/actions/fluentui-nx-proof
+        with:
+          workload: ${{ matrix.workload }}
+          cache: 'false'
+          phase: rolling-${{ inputs.step }}-control
+
+      - name: Record timing
+        if: always()
+        shell: bash
+        env:
+          ROLLING_STEP: ${{ inputs.step }}
+          STRATEGY: ${{ matrix.strategy }}
+          WORKLOAD: ${{ matrix.workload }}
+        run: |
+          set -euo pipefail
+          ended_at="$(date +%s)"
+          elapsed="$((ended_at - BENCHMARK_STARTED_AT))"
+          mkdir -p benchmark-results
+          printf '{"step":"%s","strategy":"%s","workload":"%s","base_sha":"%s","head_sha":"%s","elapsed_seconds":%s}\n' \
+            "$ROLLING_STEP" "$STRATEGY" "$WORKLOAD" "$NX_BASE" "$NX_HEAD" "$elapsed" \
+            > benchmark-results/timing.json
+          echo "### Rolling $ROLLING_STEP / $STRATEGY / $WORKLOAD: ${elapsed}s" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload timing
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: timing-rolling-${{ inputs.step }}-${{ matrix.strategy }}-${{ matrix.workload }}
+          path: benchmark-results/timing.json
+          retention-days: 7

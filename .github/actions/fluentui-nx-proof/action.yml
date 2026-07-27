@@ -1,0 +1,86 @@
+name: Fluent UI Nx proof lane
+description: Run one Fluent UI CI lane with an optional BoringCache Nx remote cache.
+
+inputs:
+  workload:
+    description: Fluent UI CI lane to run.
+    required: true
+  cache:
+    description: Configure BoringCache for Nx.
+    required: false
+    default: 'false'
+  phase:
+    description: Benchmark phase used in diagnostics.
+    required: true
+  restore-token:
+    description: BoringCache restore token.
+    required: false
+  save-token:
+    description: BoringCache save token.
+    required: false
+
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-node@v6
+      with:
+        cache: yarn
+        cache-dependency-path: source/yarn.lock
+        node-version: '22'
+
+    - name: Show runner capacity
+      shell: bash
+      run: |
+        echo "runner=${RUNNER_NAME} os=${RUNNER_OS} arch=${RUNNER_ARCH}"
+        echo "cpus=$(getconf _NPROCESSORS_ONLN)"
+
+    - name: Validate BoringCache tokens
+      if: inputs.cache == 'true'
+      shell: bash
+      env:
+        BORINGCACHE_RESTORE_TOKEN: ${{ inputs.restore-token }}
+        BORINGCACHE_SAVE_TOKEN: ${{ inputs.save-token }}
+      run: |
+        set -euo pipefail
+        [[ -n "$BORINGCACHE_RESTORE_TOKEN" ]] || {
+          echo "BORINGCACHE_RESTORE_TOKEN is missing" >&2
+          exit 1
+        }
+        [[ -n "$BORINGCACHE_SAVE_TOKEN" ]] || {
+          echo "BORINGCACHE_SAVE_TOKEN is missing" >&2
+          exit 1
+        }
+
+    - name: Configure BoringCache Nx remote cache
+      if: inputs.cache == 'true'
+      uses: boringcache/one@f21a85871dfdf6499499a17764a5cee0a7f08f92 # one-canary-93be2b89d132
+      with:
+        cli-version: vcli-canary-93be2b89d132
+        trust-policy: auto
+        setup: none
+        mode: nx
+        diagnostics: summary
+        metadata-hints: |
+          benchmark=fluentui-nx-proof
+          phase=${{ inputs.phase }}
+          workload=${{ inputs.workload }}
+      env:
+        BORINGCACHE_RESTORE_TOKEN: ${{ inputs.restore-token }}
+        BORINGCACHE_SAVE_TOKEN: ${{ inputs.save-token }}
+
+    - name: Install dependencies
+      shell: bash
+      working-directory: source
+      run: |
+        if [[ -f .yarnrc.yml ]]; then
+          yarn install --immutable
+        else
+          yarn install --frozen-lockfile
+        fi
+
+    - name: Run ${{ inputs.workload }} workload
+      shell: bash
+      working-directory: source
+      env:
+        WORKLOAD: ${{ inputs.workload }}
+      run: bash "$GITHUB_ACTION_PATH/run-workload.sh"

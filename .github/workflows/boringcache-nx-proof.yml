@@ -1,0 +1,152 @@
+name: BoringCache Nx rolling series
+
+on:
+  push:
+    branches:
+      - pr/fluentui-nx-proof
+  workflow_dispatch:
+    inputs:
+      macos_runner:
+        description: macOS runner for the three upstream macOS lanes
+        required: true
+        default: macos-14
+        type: choice
+        options:
+          - macos-14
+          - macos-14-xlarge
+      nx_parallel:
+        description: Nx parallelism matching the selected macOS runner
+        required: true
+        default: '3'
+        type: choice
+        options:
+          - '3'
+          - '6'
+      warmup_base_sha:
+        description: Commit represented by the existing cold cache
+        required: true
+        default: e85170a2cc9139a7adfbbb524090541389cbeafe
+        type: string
+      warmup_sha:
+        description: Oldest of the latest three master commits; advances the existing cache
+        required: true
+        default: a61b2539fb114f00d9ec4618bd7ea692e936056b
+        type: string
+      rolling_1_sha:
+        description: Middle of the latest three master commits
+        required: true
+        default: 9846ec31c1f0c116edf9c632b2dec1c6eb9aae1d
+        type: string
+      rolling_2_sha:
+        description: Latest master commit
+        required: true
+        default: b7c503b1c637010d49e9b6f40c0b8de4968db204
+        type: string
+
+concurrency:
+  group: boringcache-nx-proof-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  NX_PARALLEL: ${{ inputs.nx_parallel || '3' }}
+  NX_PREFER_TS_NODE: true
+  NX_VERBOSE_LOGGING: true
+  BROWSERSLIST_IGNORE_OLD_DATA: true
+
+jobs:
+  warmup:
+    name: Advance existing cold cache
+    uses: ./.github/workflows/fluentui-nx-rolling-step.yml
+    with:
+      step: warmup
+      base_sha: ${{ inputs.warmup_base_sha || 'e85170a2cc9139a7adfbbb524090541389cbeafe' }}
+      head_sha: ${{ inputs.warmup_sha || 'a61b2539fb114f00d9ec4618bd7ea692e936056b' }}
+      macos_runner: ${{ inputs.macos_runner || 'macos-14' }}
+      nx_parallel: ${{ inputs.nx_parallel || '3' }}
+      strategies: '["boringcache"]'
+    secrets: inherit
+
+  rolling_1:
+    name: First rolling commit
+    needs: warmup
+    uses: ./.github/workflows/fluentui-nx-rolling-step.yml
+    with:
+      step: '1'
+      base_sha: ${{ inputs.warmup_sha || 'a61b2539fb114f00d9ec4618bd7ea692e936056b' }}
+      head_sha: ${{ inputs.rolling_1_sha || '9846ec31c1f0c116edf9c632b2dec1c6eb9aae1d' }}
+      macos_runner: ${{ inputs.macos_runner || 'macos-14' }}
+      nx_parallel: ${{ inputs.nx_parallel || '3' }}
+    secrets: inherit
+
+  rolling_2:
+    name: Second rolling commit
+    needs: rolling_1
+    uses: ./.github/workflows/fluentui-nx-rolling-step.yml
+    with:
+      step: '2'
+      base_sha: ${{ inputs.rolling_1_sha || '9846ec31c1f0c116edf9c632b2dec1c6eb9aae1d' }}
+      head_sha: ${{ inputs.rolling_2_sha || 'b7c503b1c637010d49e9b6f40c0b8de4968db204' }}
+      macos_runner: ${{ inputs.macos_runner || 'macos-14' }}
+      nx_parallel: ${{ inputs.nx_parallel || '3' }}
+    secrets: inherit
+
+  report:
+    name: Compare rolling-series critical paths
+    if: always()
+    needs:
+      - warmup
+      - rolling_1
+      - rolling_2
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download timing artifacts
+        uses: actions/download-artifact@v6
+        with:
+          pattern: timing-rolling-*
+          path: benchmark-results
+
+      - name: Summarize rolling-series critical paths
+        shell: bash
+        run: |
+          set -euo pipefail
+          results="benchmark-results/rolling-series.tsv"
+          : > "$results"
+
+          for step in 1 2; do
+            control_seconds="$(jq -s 'map(.elapsed_seconds) | max' benchmark-results/timing-rolling-${step}-control-*/timing.json)"
+            boringcache_seconds="$(jq -s 'map(.elapsed_seconds) | max' benchmark-results/timing-rolling-${step}-boringcache-*/timing.json)"
+            head_sha="$(jq -r '.head_sha' benchmark-results/timing-rolling-${step}-boringcache-main/timing.json)"
+            saved_seconds="$((control_seconds - boringcache_seconds))"
+            saved_percent="$(awk -v saved="$saved_seconds" -v control="$control_seconds" \
+              'BEGIN { if (control == 0) print "0.0"; else printf "%.1f", (saved / control) * 100 }')"
+            printf '%s\t%s\t%s\t%s\t%s\n' \
+              "$step" "$head_sha" "$control_seconds" "$boringcache_seconds" "$saved_percent" >> "$results"
+          done
+
+          {
+            echo "## Fluent UI current-main rolling series"
+            echo
+            echo "| Step | Commit | No Nx remote cache | BoringCache | Saved |"
+            echo "| ---: | --- | ---: | ---: | ---: |"
+            while IFS=$'\t' read -r step head_sha control_seconds boringcache_seconds saved_percent; do
+              echo "| $step | \`${head_sha:0:10}\` | ${control_seconds}s | ${boringcache_seconds}s | ${saved_percent}% |"
+            done < "$results"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload series results
+        uses: actions/upload-artifact@v6
+        with:
+          name: fluentui-current-main-rolling-series
+          path: benchmark-results/rolling-series.tsv
+          retention-days: 30
+
+      - name: Require every proof lane to pass
+        if: always() && (needs.warmup.result != 'success' || needs.rolling_1.result != 'success' || needs.rolling_2.result != 'success')
+        shell: bash
+        run: |
+          echo "The cache warmup or at least one rolling-series lane failed." >&2
+          exit 1
